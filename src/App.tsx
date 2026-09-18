@@ -3,6 +3,7 @@ import AddressBar from './components/AddressBar'
 import BaselinePanel from './components/BaselinePanel'
 import DhcpPoolPanel from './components/DhcpPoolPanel'
 import HostAddressPanel from './components/HostAddressPanel'
+import LeaseImportPanel from './components/LeaseImportPanel'
 import Option121Panel from './components/Option121Panel'
 import { ReflowSummaryBar } from './components/ReflowReport'
 import ReverseDnsPanel from './components/ReverseDnsPanel'
@@ -65,6 +66,8 @@ export default function App() {
   // DHCP 动态地址池：宿主网段（需求稳定 ID）+ 多段手工排除区间（行内稳定 ID，规划变化后保留并重新校验）
   const [dhcpPoolOwnerId, setDhcpPoolOwnerId] = useState('')
   const [dhcpPoolExclusions, setDhcpPoolExclusions] = useState<DhcpExclusionInput[]>([])
+  // 静态租约批量导入：原始 CSV 文本始终保留在页面内存中，规划/登记变化后实时重算预览
+  const [leaseImportCsv, setLeaseImportCsv] = useState('')
 
   // 重排生效条件：有基线、父网段为规范 CIDR 且与基线完全一致（输入非法/父网段变化时禁用）
   const parentForReflow = useMemo(() => {
@@ -133,6 +136,7 @@ export default function App() {
     setReverseDnsOwnerId('')
     setDhcpPoolOwnerId('')
     setDhcpPoolExclusions([])
+    setLeaseImportCsv('')
   }
 
   function clearAll() {
@@ -146,6 +150,7 @@ export default function App() {
     setReverseDnsOwnerId('')
     setDhcpPoolOwnerId('')
     setDhcpPoolExclusions([])
+    setLeaseImportCsv('')
   }
 
   const hasInput =
@@ -384,6 +389,14 @@ export default function App() {
         exclusions={dhcpPoolExclusions}
         onOwnerChange={setDhcpPoolOwnerId}
         onExclusionsChange={setDhcpPoolExclusions}
+      />
+
+      <LeaseImportPanel
+        result={result}
+        assignments={hostAssignments}
+        csv={leaseImportCsv}
+        onCsvChange={setLeaseImportCsv}
+        onAssignmentsChange={setHostAssignments}
       />
 
       {result.segments.length > 0 && (

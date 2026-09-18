@@ -17,6 +17,7 @@ import {
 } from '../src/lib/reverseDns'
 import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/option121'
 import { buildDhcpPool, resolvePoolSegment } from '../src/lib/dhcpPool'
+import { buildLeaseImport, mapHeader, parseCsv } from '../src/lib/leaseImport'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
 import { intToIp, ipToInt, prefixForHosts } from '../src/lib/ip'
@@ -2016,6 +2017,237 @@ check('空选择 / 已删除需求解析为 null', resolvePoolSegment(hostPlan, 
   buildDhcpPool(entries, hosts, hostPlan, seg)
   check('生成过程不改写排除录入与登记', JSON.stringify(entries) === snapE && JSON.stringify(hosts) === snapH)
   check('导出 JSON 不含 dhcp-range 内容', !/dhcp-range|动态地址池/.test(buildExportJson(hostPlan, { parentCidr: demo.parentCidr })))
+}
+
+// ========== 22) 静态租约批量导入 ==========
+
+// 22a) CSV 解析：引号、转义双引号、字段内逗号/换行、CRLF、BOM、空行
+{
+  const recs = parseCsv('﻿网段 CIDR,设备名\r\n192.168.10.16/30,"设备,A"\r\n\r\n"x""y",z\n')
+  check('CSV 解析：BOM 去除、CRLF、跳过空行（3 条记录）', recs.length === 3, JSON.stringify(recs))
+  check('CSV 表头两列', recs[0].cells.length === 2 && recs[0].cells[0] === '网段 CIDR')
+  check('CSV 引号内逗号不切分', recs[1].cells[1] === '设备,A')
+  check('CSV 双引号转义', recs[2].cells[0] === 'x"y' && recs[2].line === 4, JSON.stringify(recs[2]))
+  check('空文本解析为空记录', parseCsv('  \n \n').length === 0)
+}
+
+// 22b) 表头映射：别名、列顺序不限；缺列 / 重复列报错
+{
+  const ok = mapHeader({ line: 1, cells: ['mac', 'ip地址', '名称', '子网'] })
+  check('表头别名识别且顺序不限', !!ok.map && ok.map!.cidr === 3 && ok.map!.name === 2 && ok.map!.ip === 1 && ok.map!.mac === 0, JSON.stringify(ok))
+  const missing = mapHeader({ line: 1, cells: ['网段 CIDR', '设备名', 'IPv4'] })
+  check('表头缺 MAC 列报错', missing.error?.kind === 'missing' && missing.error.columns?.includes('mac'), JSON.stringify(missing.error))
+  const dup = mapHeader({ line: 1, cells: ['IPv4', 'ip', '设备名', 'MAC', '网段 CIDR'] })
+  check('表头重复列报错（IPv4/ip 同列）', dup.error?.kind === 'duplicate' && dup.error.column === 'ip', JSON.stringify(dup.error))
+  check('空 CSV 表头报 empty', mapHeader(undefined).error?.kind === 'empty')
+}
+
+// 演示规划：q4=192.168.10.16/30（.17/.18），q1=128/25，q2=64/26，q3=32/27
+const importCsvAllNew = [
+  '网段 CIDR,设备名,IPv4,MAC',
+  '192.168.10.16/30,管理设备A,192.168.10.17,AA-BB-CC-00-00-01',
+  '192.168.10.16/30,管理设备B,192.168.10.18,aa:bb:cc:00:00:02',
+  '192.168.10.32/27,监控网关,192.168.10.33,aa:bb:cc:00:00:03',
+].join('\n')
+
+// 22c) 全新 MAC：三行全部新增，可应用，merged 追加 3 条且 mode=manual
+{
+  const built = buildLeaseImport(importCsvAllNew, [], hostPlan, (() => {
+    let n = 0
+    return () => `new-${++n}`
+  })())
+  check('全新导入无冲突、3 行新增', built.canApply && built.counts.add === 3 && built.counts.conflict === 0, JSON.stringify(built.counts))
+  check('MAC 连字符大写被规范为小写冒号', built.rows[0].mac === 'aa:bb:cc:00:00:01')
+  check('非规范 CIDR 写法被接受并匹配（此处已是规范）', built.rows[0].cidr === '192.168.10.16/30' && built.rows[0].segment?.ownerId === 'q4')
+  check('应用后快照为 3 条、跨两个网段', built.merged.length === 3 && built.merged.every((a) => a.mode === 'manual'))
+  check('固定段 q3 行归属正确', built.rows[2].segment?.ownerId === 'q3')
+}
+
+// 22d) 已有 MAC 更新名称、网段与地址；未变化行标记 unchanged
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '旧名', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'h2', ownerId: 'q4', name: '保持', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    // h1 迁到办公网段并改名、改址
+    '192.168.10.128/25,新办公设备,192.168.10.200,AA:BB:CC:00:00:01',
+    // h2 内容完全一致 -> 无变化
+    '192.168.10.16/30,保持,192.168.10.18,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const built = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('更新 + 无变化各 1 行、无冲突', built.counts.update === 1 && built.counts.unchanged === 1 && built.canApply, JSON.stringify(built.counts))
+  const updated = built.merged.find((a) => a.id === 'h1')!
+  check('更新行：名称/网段/地址全量替换且 mode=manual，ID 保持不变',
+    updated.name === '新办公设备' && updated.ownerId === 'q1' && updated.address === ipToInt('192.168.10.200') && updated.mode === 'manual' && updated.mac === 'aa:bb:cc:00:00:01',
+    JSON.stringify(updated))
+  check('未变化行原样保留', (() => {
+    const h2 = built.merged.find((a) => a.id === 'h2')!
+    return h2.name === '保持' && h2.address === ipToInt('192.168.10.18') && h2.mode === 'manual'
+  })())
+  check('应用快照不改变登记总数（2 台）', built.merged.length === 2)
+}
+
+// 22e) 核心场景：两台已有设备互换地址，顺序无关校验不误报
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '设备A', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'h2', ownerId: 'q4', name: '设备B', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  // 无论 A 在前还是 B 在前都必须通过（CSV 行序 1：A 先占 .18）
+  const csvA = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,设备A,192.168.10.18,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,设备B,192.168.10.17,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const csvB = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,设备B,192.168.10.17,aa:bb:cc:00:00:02',
+    '192.168.10.16/30,设备A,192.168.10.18,aa:bb:cc:00:00:01',
+  ].join('\n')
+  for (const [label, text] of [['A先行', csvA], ['B先行', csvB]] as const) {
+    const built = buildLeaseImport(text, existing, hostPlan, () => 'x')
+    check(`互换地址（${label}）两行均更新、零冲突`, built.canApply && built.counts.update === 2 && built.counts.conflict === 0,
+      JSON.stringify(built.rows.map((r) => [r.status, r.errors])))
+    const after = new Map(built.merged.map((a) => [a.mac, intToIp(a.address)]))
+    check(`互换地址（${label}）最终地址确实交换`, after.get('aa:bb:cc:00:00:01') === '192.168.10.18' && after.get('aa:bb:cc:00:00:02') === '192.168.10.17')
+  }
+}
+
+// 22f) 字段级冲突：缺失、非法 IP、非法 MAC、网络/广播/越界
+{
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    ',缺网段,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,,192.168.10.17,aa:bb:cc:00:00:02',
+    '192.168.10.16/30,缺IP,,aa:bb:cc:00:00:03',
+    '192.168.10.16/30,坏IP,999.1.1.1,aa:bb:cc:00:00:04',
+    '192.168.10.16/30,坏MAC,192.168.10.17,zz:bb:cc:dd:ee:ff',
+    '192.168.10.16/30,网络地址,192.168.10.16,aa:bb:cc:00:00:05',
+    '192.168.10.16/30,广播地址,192.168.10.19,aa:bb:cc:00:00:06',
+    '192.168.10.16/30,越界,192.168.10.40,aa:bb:cc:00:00:07',
+    '192.168.10.96/28,不存在的网段,192.168.10.97,aa:bb:cc:00:00:08',
+  ].join('\n')
+  const built = buildLeaseImport(csv, [], hostPlan, () => 'x')
+  check('9 行问题数据全部标冲突、禁止应用', built.counts.conflict === 9 && !built.canApply && built.counts.add === 0, JSON.stringify(built.counts))
+  check('网络地址行报错含网络地址', /网络地址/.test(built.rows[5].errors.join(' ')))
+  check('广播地址行报错含广播地址', /广播地址/.test(built.rows[6].errors.join(' ')))
+  check('越界行报错含可用范围', /越界|不在网段/.test(built.rows[7].errors.join(' ')))
+  check('网段不匹配行报错', /不是当前成功分配/.test(built.rows[8].errors.join(' ')))
+  check('非法 MAC（非十六进制）报错', built.rows[4].errors.some((m) => /不是合法 MAC/.test(m)))
+  check('有冲突时 merged 保持既有状态（空）', built.merged.length === 0)
+}
+
+// 22g) 输入内重复 MAC 与网段内重复 IP
+{
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,A,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,B,192.168.10.18,AA:BB:CC:00:00:01', // 同 MAC（大小写归一）
+    '192.168.10.32/27,C,192.168.10.34,aa:bb:cc:00:00:03',
+    '192.168.10.32/27,D,192.168.10.34,aa:bb:cc:00:00:04', // 同网段重复 IP
+    '192.168.10.32/27,E,192.168.10.35,aa:bb:cc:00:00:05',
+  ].join('\n')
+  const built = buildLeaseImport(csv, [], hostPlan, () => 'x')
+  check('重复 MAC（归一后）第二条标冲突并指向第 1 行', built.rows[1].errors.some((m) => /第 1 行/.test(m)))
+  check('网段内重复 IP 第四条标冲突并指向第 3 行', built.rows[3].errors.some((m) => /第 3 行/.test(m)) && built.rows[3].status === 'conflict')
+  check('不同网段相同 IP 不算重复（.34 vs .34 分别在 q3…构造同段外对照）', built.rows[2].status !== 'conflict', built.rows[2].status)
+  check('干净行仍可新增（第 1、5 行）', built.rows[0].status === 'add' && built.rows[4].status === 'add')
+  check('任一冲突禁止应用', !built.canApply)
+}
+
+// 22h) 与未更新登记的冲突（地址被占用、MAC 已存在）
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '未更新设备', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:11:11:11' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,新设备撞地址,192.168.10.17,aa:bb:cc:22:22:22',
+  ].join('\n')
+  const built = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('与未更新登记地址冲突被标出并指明设备名', built.rows[0].status === 'conflict' && /未更新设备/.test(built.rows[0].errors.join(' ')), JSON.stringify(built.rows[0].errors))
+  check('冲突时既有登记原样保留在 merged', built.merged.length === 1 && built.merged[0].id === 'h1')
+}
+
+// 22i) 更新登记迁址到未更新设备占用的地址 -> 冲突（不是互换）
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '迁移者', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+    { id: 'h2', ownerId: 'q4', name: '留守者', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:00:00:02' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,迁移者,192.168.10.18,aa:bb:cc:00:00:01',
+  ].join('\n')
+  const built = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('单向迁入被占用地址（非互换）判冲突并指向未更新设备', built.rows[0].status === 'conflict' && /留守者/.test(built.rows[0].errors.join(' ')), JSON.stringify(built.rows[0].errors))
+}
+
+// 22j) 应用原子性：冲突时 merged 等于既有状态；全部通过后 merged 为完整快照
+{
+  const existing: HostAssignment[] = [
+    { id: 'keep', ownerId: 'q1', name: '办公设备', address: ipToInt('192.168.10.200'), mode: 'auto', mac: 'aa:bb:cc:99:99:99' },
+  ]
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+    '192.168.10.16/30,坏行,192.168.10.19,aa:bb:cc:00:00:02',
+  ].join('\n')
+  const bad = buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('部分冲突：禁止应用且未更新登记保持不变', !bad.canApply && bad.merged.length === 1 && bad.merged[0].id === 'keep')
+  const goodCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01'].join('\n')
+  const good = buildLeaseImport(goodCsv, existing, hostPlan, (() => {
+    let n = 0
+    return () => `gen-${++n}`
+  })())
+  check('全部通过：完整快照 = 未更新登记 + 新增/更新', good.canApply && good.merged.length === 2 && good.addCount === 1 && good.updateCount === 0)
+  check('快照中未更新登记原样保留（含 auto 方式）', good.merged.find((a) => a.id === 'keep')?.mode === 'auto')
+}
+
+// 22k) 规划变化后实时重算：原 CSV 保留，网段失效则预览转为冲突；恢复后再次通过
+{
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.16/30,管理A,192.168.10.17,aa:bb:cc:00:00:01',
+  ].join('\n')
+  const before = buildLeaseImport(csv, [], hostPlan, () => 'x')
+  check('原规划下导入行可新增', before.canApply && before.rows[0].status === 'add')
+  // q4 迁到 20/30：16/30 不再是成功分配网段
+  const after = buildLeaseImport(csv, [], migratedPlan, () => 'x')
+  check('规划迁移后同一 CSV 实时重算为网段冲突', !after.canApply && after.rows[0].status === 'conflict' && /不是当前成功分配/.test(after.rows[0].errors.join(' ')))
+  const fixedCsv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.20/30,管理A,192.168.10.21,aa:bb:cc:00:00:01',
+  ].join('\n')
+  check('改到新网段合法地址后恢复可应用', buildLeaseImport(fixedCsv, [], migratedPlan, () => 'x').canApply)
+}
+
+// 22l) 保留区/空闲网段 CIDR 不能匹配；只有表头不可应用
+{
+  const csv = [
+    '网段 CIDR,设备名,IPv4,MAC',
+    '192.168.10.0/28,保留区内,192.168.10.1,aa:bb:cc:00:00:01',
+  ].join('\n')
+  const built = buildLeaseImport(csv, [], hostPlan, () => 'x')
+  check('保留区 CIDR 不可作为导入网段', built.rows[0].status === 'conflict' && /不是当前成功分配/.test(built.rows[0].errors.join(' ')))
+  const headerOnly = buildLeaseImport('网段 CIDR,设备名,IPv4,MAC\n', [], hostPlan, () => 'x')
+  check('只有表头无数据行时不可应用', !headerOnly.canApply && headerOnly.rows.length === 0 && headerOnly.headerErrors.length === 0)
+  const badHeader = buildLeaseImport('CIDR,Name,MAC\n192.168.10.16/30,x,aa:bb:cc:00:00:01', [], hostPlan, () => 'x')
+  check('表头缺 IPv4 列给出表头错误且无逐行数据', badHeader.headerErrors.length === 1 && badHeader.rows.length === 0 && !badHeader.canApply)
+}
+
+// 22m) 只读隔离：导入构造不修改既有登记数组，也不影响规划/导出
+{
+  const existing: HostAssignment[] = [
+    { id: 'h1', ownerId: 'q4', name: '旧名', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:00:00:01' },
+  ]
+  const snapshot = JSON.stringify(existing)
+  const csv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.128/25,新名,192.168.10.200,aa:bb:cc:00:00:01'].join('\n')
+  buildLeaseImport(csv, existing, hostPlan, () => 'x')
+  check('预览计算不改写既有登记数组', JSON.stringify(existing) === snapshot && existing[0].ownerId === 'q4')
+  check('规划结果不受导入影响', JSON.stringify(plan(demo)) === JSON.stringify(plan(demo)))
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
