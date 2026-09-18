@@ -83,7 +83,7 @@ export default function ReverseDnsPanel({ result, assignments, ownerId, onOwnerC
 
   return (
     <div className="panel opt121-panel">
-      <h2>⑧ 反向 DNS 区域文件（in-addr.arpa / RFC 2317）</h2>
+      <h2>⑨ 反向 DNS 区域文件（in-addr.arpa / RFC 2317）</h2>
       <p className="subtitle" style={{ marginBottom: 10 }}>
         选择一个当前<strong>成功分配</strong>的固定 / 自动网段，读取其中当前<strong>有效</strong>
         （地址仍在所属网段可用范围内、未重复）且设备名为<strong>合法绝对域名</strong>的主机登记：

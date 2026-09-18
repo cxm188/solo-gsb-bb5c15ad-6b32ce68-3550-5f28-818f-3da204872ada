@@ -17,6 +17,7 @@ import {
 } from '../src/lib/reverseDns'
 import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/option121'
 import { buildDhcpPool, resolvePoolSegment } from '../src/lib/dhcpPool'
+import { applyBulkPreview, buildBulkPreview } from '../src/lib/bulkImport'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
 import { intToIp, ipToInt, prefixForHosts } from '../src/lib/ip'
@@ -2016,6 +2017,214 @@ check('空选择 / 已删除需求解析为 null', resolvePoolSegment(hostPlan, 
   buildDhcpPool(entries, hosts, hostPlan, seg)
   check('生成过程不改写排除录入与登记', JSON.stringify(entries) === snapE && JSON.stringify(hosts) === snapH)
   check('导出 JSON 不含 dhcp-range 内容', !/dhcp-range|动态地址池/.test(buildExportJson(hostPlan, { parentCidr: demo.parentCidr })))
+}
+
+// ========== 22) 静态租约批量导入 ==========
+{
+  // 演示规划：q4=192.168.10.16/30（.17/.18），q3=32/27（.33~.62），q2=64/26，q1=128/25
+  const HEADER = '网段 CIDR,设备名,IPv4,MAC'
+
+  // 22a) 空输入 / 只有空白：无内容、不可应用
+  const emptyPrev = buildBulkPreview('   \n  \t', [], hostPlan)
+  check('空 CSV：无内容、无行、不可应用', !emptyPrev.hasContent && emptyPrev.rows.length === 0 && !emptyPrev.canApply)
+
+  // 22b) 缺表头：给出 headerError，不解析数据行
+  const noHeader = buildBulkPreview('192.168.10.16/30,网关,192.168.10.17,aa:bb:cc:dd:ee:ff', [], hostPlan)
+  check('缺必备表头报错', !!noHeader.headerError && /表头缺少必备列/.test(noHeader.headerError), noHeader.headerError ?? '')
+  const badHeader = buildBulkPreview('网段,设备名,IPv4,MAC\n', [], hostPlan)
+  check('表头列名不对报缺少网段 CIDR', !!badHeader.headerError && /网段CIDR/.test(badHeader.headerError))
+
+  // 22c) 全新 MAC：新增；MAC 连字符自动规范化为小写冒号；空白行跳过、CRLF/引号均可
+  const addCsv = [
+    HEADER,
+    '',
+    '192.168.10.16/30,管理网关,192.168.10.17,AA-BB-CC-DD-EE-FF',
+    '"192.168.10.128/25","办公,电脑",192.168.10.130,00:11:22:33:44:55\r',
+  ].join('\n')
+  const addPrev = buildBulkPreview(addCsv, [], hostPlan)
+  check('全新导入 2 行全部为新增且可应用', addPrev.canApply && addPrev.counts.add === 2 && addPrev.rows.length === 2, JSON.stringify(addPrev.rows.map((r) => [r.status, r.errors])))
+  check('连字符大写 MAC 规范化为小写冒号', addPrev.rows[0].mac === 'aa:bb:cc:dd:ee:ff' && addPrev.rows[1].mac === '00:11:22:33:44:55')
+  check('带引号/逗号的设备名正确解析', addPrev.rows[1].name === '办公,电脑', addPrev.rows[1].name)
+  check('网段行匹配到带类型徽标的唯一固定/自动网段', addPrev.rows[0].segment?.cidr === '192.168.10.16/30' && addPrev.rows[1].segment?.kind === 'auto')
+  const added = applyBulkPreview(addPrev, [], () => `new-${Math.random()}`)
+  check('应用后得到 2 条登记，owner/地址/MAC 正确', added.length === 2 && added[0].ownerId === 'q4' && added[0].address === ipToInt('192.168.10.17') && added[0].mac === 'aa:bb:cc:dd:ee:ff' && added[1].mode === 'manual')
+
+  // 22d) 已有 MAC：按 MAC 匹配更新名称、网段与地址；完全相同 -> 无变化
+  const existing: HostAssignment[] = [
+    { id: 'e1', ownerId: 'q4', name: '旧网关', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:ff' },
+    { id: 'e2', ownerId: 'q1', name: '办公电脑', address: ipToInt('192.168.10.200'), mode: 'manual', mac: '00:11:22:33:44:55' },
+  ]
+  const updCsv = [
+    HEADER,
+    '192.168.10.16/30,新网关名,192.168.10.18,aa:bb:cc:dd:ee:ff', // 同段改址 + 改名
+    '192.168.10.128/25,办公电脑,192.168.10.200,00:11:22:33:44:55', // 完全一致
+    '192.168.10.128/25,机房迁来的设备,192.168.10.130,0a:0b:0c:0d:0e:0f', // 新 MAC
+  ].join('\n')
+  const updPrev = buildBulkPreview(updCsv, existing, hostPlan)
+  check('更新/无变化/新增各 1 行且可应用', updPrev.canApply && updPrev.counts.update === 1 && updPrev.counts.unchanged === 1 && updPrev.counts.add === 1, JSON.stringify(updPrev.counts))
+  check('更新行匹配到既有设备 e1', updPrev.rows[0].existing?.id === 'e1')
+  let seq = 0
+  const updApplied = applyBulkPreview(updPrev, existing, () => `id-${++seq}`)
+  check('应用保持既有登记 id 与顺序，新登记追加在末尾', updApplied.map((a) => a.id).join(',') === 'e1,e2,id-1')
+  check('e1 名称地址更新、改址后模式变 manual', updApplied[0].name === '新网关名' && updApplied[0].address === ipToInt('192.168.10.18') && updApplied[0].mode === 'manual')
+  check('无变化行 e2 原样保留（含 mode）', updApplied[1].name === '办公电脑' && updApplied[1].address === ipToInt('192.168.10.200') && updApplied[1].mode === 'manual')
+
+  // 22e) 缺失 / 非法字段逐行标记
+  const badCsv = [
+    HEADER,
+    '192.168.10.16/30,,192.168.10.17,01:bb:cc:dd:ee:11', // 缺名 + 组播 MAC（多错并列）
+    ',设备,192.168.10.17,aa:bb:cc:dd:ee:02', // 缺 CIDR
+    '192.168.10.16/30,设备,,aa:bb:cc:dd:ee:03', // 缺 IP
+    '192.168.10.16/30,设备,192.168.10.17,', // 缺 MAC
+    'not-a-cidr,设备,192.168.10.17,aa:bb:cc:dd:ee:04', // CIDR 非法
+    '192.168.10.16/30,设备,999.1.1.1,aa:bb:cc:dd:ee:05', // IP 非法
+    '192.168.10.16/30,设备,192.168.10.17,zz:bb:cc:dd:ee:06', // MAC 非法
+  ].join('\n')
+  const badPrev = buildBulkPreview(badCsv, [], hostPlan)
+  check('7 行全部冲突、不可应用', badPrev.counts.conflict === 7 && !badPrev.canApply, JSON.stringify(badPrev.rows.map((r) => r.errors)))
+  check('缺设备名报错', badPrev.rows[0].errors.some((m) => /缺少设备名/.test(m)))
+  check('组播 MAC 报错', badPrev.rows[0].errors.some((m) => /组播位/.test(m)))
+  check('缺 CIDR / IP / MAC 分别报错', badPrev.rows[1].errors.some((m) => /缺少网段/.test(m)) && badPrev.rows[2].errors.some((m) => /缺少 IPv4/.test(m)) && badPrev.rows[3].errors.some((m) => /缺少 MAC/.test(m)))
+  check('非法 CIDR / IPv4 / MAC 报错', badPrev.rows[4].errors.some((m) => /格式无效|网络地址/.test(m)) && badPrev.rows[5].errors.some((m) => /不是合法的 IPv4/.test(m)) && badPrev.rows[6].errors.some((m) => /不是合法 MAC/.test(m)))
+
+  // 22f) 网段必须唯一匹配固定 / 自动网段：保留区、空闲区、失败需求均拒绝
+  const segCsv = [
+    HEADER,
+    '192.168.10.0/28,保留区设备,192.168.10.1,aa:bb:cc:dd:ee:11', // 保留区
+    '192.168.10.20/30,空闲块,192.168.10.21,aa:bb:cc:dd:ee:12', // 当前空闲
+    '10.0.0.0/24,别的父网段,10.0.0.1,aa:bb:cc:dd:ee:13', // 完全不在规划
+  ].join('\n')
+  const segPrev = buildBulkPreview(segCsv, [], hostPlan)
+  check('保留区 / 空闲区 / 外部网段均判为冲突', segPrev.counts.conflict === 3 && segPrev.rows.every((r) => /不匹配任何当前成功分配/.test(r.errors[0])), JSON.stringify(segPrev.rows.map((r) => r.errors)))
+
+  // 22g) 网络地址 / 广播地址 / 越界地址
+  const edgeCsv = [
+    HEADER,
+    '192.168.10.16/30,网络地址,192.168.10.16,aa:bb:cc:dd:ee:21',
+    '192.168.10.16/30,广播地址,192.168.10.19,aa:bb:cc:dd:ee:22',
+    '192.168.10.16/30,越界,192.168.10.33,aa:bb:cc:dd:ee:23',
+  ].join('\n')
+  const edgePrev = buildBulkPreview(edgeCsv, [], hostPlan)
+  check('网络/广播/越界地址均判冲突', edgePrev.counts.conflict === 3 && /网络地址/.test(edgePrev.rows[0].errors[0]) && /广播地址/.test(edgePrev.rows[1].errors[0]) && /越出网段/.test(edgePrev.rows[2].errors[0]))
+
+  // 22h) 输入内重复 MAC；同网段重复 IP（跨网段相同 IP 合法）
+  const dupCsv = [
+    HEADER,
+    '192.168.10.16/30,设备A,192.168.10.17,aa:bb:cc:dd:ee:31',
+    '192.168.10.128/25,设备B,192.168.10.130,aa:bb:cc:dd:ee:31', // 同 MAC（大小写/分隔符归一后）
+    '192.168.10.16/30,设备C,192.168.10.17,aa:bb:cc:dd:ee:32', // 同段重复 IP
+    '192.168.10.128/25,设备D,192.168.10.131,aa:bb:cc:dd:ee:33', // 不同段地址：合法新增
+  ].join('\n')
+  const dupPrev = buildBulkPreview(dupCsv, [], hostPlan)
+  check('重复 MAC 行判冲突并指向第 1 条', dupPrev.rows[1].errors.some((m) => /与输入内第 1 条重复/.test(m)))
+  check('同网段重复 IP 判冲突并指向第 1 条', dupPrev.rows[2].errors.some((m) => /同一网段重复/.test(m)))
+  check('不同网段的地址合法（设备D 新增）', dupPrev.rows[3].status === 'add' && dupPrev.rows[3].errors.length === 0)
+  check('存在输入内重复时整体不可应用', !dupPrev.canApply)
+
+  // 22i) 与未更新登记冲突：占用 .18 的既有设备不在 CSV 中
+  const clashHosts: HostAssignment[] = [
+    { id: 'c1', ownerId: 'q4', name: '占着18的设备', address: ipToInt('192.168.10.18'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:41' },
+  ]
+  const clashCsv = [HEADER, '192.168.10.16/30,新来的,192.168.10.18,aa:bb:cc:dd:ee:42'].join('\n')
+  const clashPrev = buildBulkPreview(clashCsv, clashHosts, hostPlan)
+  check('新 MAC 抢占未更新登记地址 -> 冲突且点名设备', clashPrev.rows[0].status === 'conflict' && /未在本次 CSV 中更新的既有登记/.test(clashPrev.rows[0].errors[0]) && /占着18的设备/.test(clashPrev.rows[0].errors[0]), clashPrev.rows[0].errors[0])
+  check('存在与既有登记冲突时不可应用', !clashPrev.canApply)
+
+  // 22j) 核心不变量：两台既有设备互换地址，不因处理顺序误报（正序/逆序都通过）
+  const swapHosts: HostAssignment[] = [
+    { id: 's1', ownerId: 'q3', name: '设备甲', address: ipToInt('192.168.10.33'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:51' },
+    { id: 's2', ownerId: 'q3', name: '设备乙', address: ipToInt('192.168.10.34'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:52' },
+  ]
+  const mkSwapCsv = (reverse: boolean) =>
+    [
+      HEADER,
+      ...(reverse
+        ? [
+            '192.168.10.32/27,设备乙,192.168.10.33,aa:bb:cc:dd:ee:52',
+            '192.168.10.32/27,设备甲,192.168.10.34,aa:bb:cc:dd:ee:51',
+          ]
+        : [
+            '192.168.10.32/27,设备甲,192.168.10.34,aa:bb:cc:dd:ee:51',
+            '192.168.10.32/27,设备乙,192.168.10.33,aa:bb:cc:dd:ee:52',
+          ]),
+    ].join('\n')
+  for (const reverse of [false, true]) {
+    const swapPrev = buildBulkPreview(mkSwapCsv(reverse), swapHosts, hostPlan)
+    check(`互换地址（${reverse ? '逆序' : '正序'}）两行均为更新、无冲突、可应用`, swapPrev.canApply && swapPrev.counts.update === 2 && swapPrev.rows.every((r) => r.errors.length === 0), JSON.stringify(swapPrev.rows.map((r) => r.errors)))
+    const swapped = applyBulkPreview(swapPrev, swapHosts, () => 'x')
+    check(`互换地址（${reverse ? '逆序' : '正序'}）应用后地址确实交换、id 顺序保留`, swapped[0].id === 's1' && swapped[0].address === ipToInt('192.168.10.34') && swapped[1].id === 's2' && swapped[1].address === ipToInt('192.168.10.33'))
+  }
+
+  // 22k) 互换中一台改成第三个地址（与未更新登记无关），CSV 未覆盖的旁观者被撞才报冲突
+  const threeHosts: HostAssignment[] = [
+    { id: 't1', ownerId: 'q3', name: '甲', address: ipToInt('192.168.10.33'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:61' },
+    { id: 't2', ownerId: 'q3', name: '乙', address: ipToInt('192.168.10.34'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:62' },
+    { id: 't3', ownerId: 'q3', name: '丙', address: ipToInt('192.168.10.35'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:63' },
+  ]
+  const threeCsv = [
+    HEADER,
+    '192.168.10.32/27,甲,192.168.10.34,aa:bb:cc:dd:ee:61', // 甲 -> 乙原址
+    '192.168.10.32/27,乙,192.168.10.33,aa:bb:cc:dd:ee:62', // 乙 -> 甲原址（互换）
+    // 丙未出现在 CSV，仍占 .35；这里没有 CSV 行撞 .35，应通过
+  ].join('\n')
+  const threePrev = buildBulkPreview(threeCsv, threeHosts, hostPlan)
+  check('甲乙互换、旁观者丙不参与 -> 无冲突可应用', threePrev.canApply && threePrev.counts.update === 2, JSON.stringify(threePrev.rows.map((r) => r.errors)))
+  const hitBystanderCsv = [
+    HEADER,
+    '192.168.10.32/27,甲,192.168.10.35,aa:bb:cc:dd:ee:61', // 甲 -> 丙（未更新）原址
+  ].join('\n')
+  const hitPrev = buildBulkPreview(hitBystanderCsv, threeHosts, hostPlan)
+  check('撞到未更新的丙 -> 点名丙冲突', hitPrev.rows[0].errors.some((m) => /丙/.test(m)) && !hitPrev.canApply)
+
+  // 22l) 已有 MAC 迁移到另一个网段（owner 更新；旧地址释放后可被新 MAC 使用，顺序无关）
+  const moveHosts: HostAssignment[] = [
+    { id: 'm1', ownerId: 'q4', name: '搬家设备', address: ipToInt('192.168.10.17'), mode: 'auto', mac: 'aa:bb:cc:dd:ee:71' },
+  ]
+  // 逆序放「新 MAC 占用 .17」+「旧 MAC 搬到 q3」：快照统一校验下必须通过
+  const moveCsv = [
+    HEADER,
+    '192.168.10.16/30,接替者,192.168.10.17,aa:bb:cc:dd:ee:72',
+    '192.168.10.32/27,搬家设备,192.168.10.40,aa:bb:cc:dd:ee:71',
+  ].join('\n')
+  const movePrev = buildBulkPreview(moveCsv, moveHosts, hostPlan)
+  check('旧设备迁出、新设备接替旧地址（逆序）无冲突', movePrev.canApply && movePrev.counts.add === 1 && movePrev.counts.update === 1, JSON.stringify(movePrev.rows.map((r) => r.errors)))
+  const moved = applyBulkPreview(movePrev, moveHosts, () => 'm2')
+  check('迁移后旧登记 owner/地址更新、新登记落到 q4 .17', moved[0].id === 'm1' && moved[0].ownerId === 'q3' && moved[0].address === ipToInt('192.168.10.40') && moved[1].ownerId === 'q4' && moved[1].address === ipToInt('192.168.10.17'))
+
+  // 22m) 纯函数：不修改原始登记、CSV 预览对象与既有 id；不可应用时 apply 原样返回
+  const immutHosts: HostAssignment[] = [
+    { id: 'z1', ownerId: 'q4', name: '甲', address: ipToInt('192.168.10.17'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:81' },
+  ]
+  const snap = JSON.stringify(immutHosts)
+  const okPrev = buildBulkPreview([HEADER, '192.168.10.16/30,甲,192.168.10.17,aa:bb:cc:dd:ee:81'].join('\n'), immutHosts, hostPlan)
+  check('预览不修改既有登记', JSON.stringify(immutHosts) === snap)
+  check('完全相同行 -> 无变化', okPrev.rows[0].status === 'unchanged')
+  const rejectPrev = buildBulkPreview([HEADER, '192.168.10.16/30,x,192.168.10.16,aa:bb:cc:dd:ee:82'].join('\n'), immutHosts, hostPlan)
+  check('不可应用时 applyBulkPreview 返回同一数组', applyBulkPreview(rejectPrev, immutHosts, () => 'x') === immutHosts)
+
+  // 22n) 规划非法时由调用方暂停（库本身按传入规划计算；失败需求的网段不匹配）
+  const badPlan = plan({
+    parentCidr: '192.168.10.0/30',
+    reservations: [],
+    requirements: [{ id: 'q4', name: '放不下', hosts: 100, cidr: '' }],
+  })
+  const pausedPrev = buildBulkPreview([HEADER, '192.168.10.16/30,设备,192.168.10.17,aa:bb:cc:dd:ee:91'].join('\n'), [], badPlan)
+  check('分配失败的需求网段不匹配（调用方据此暂停 / 禁应用）', pausedPrev.rows[0].errors.some((m) => /不匹配任何当前成功分配/.test(m)))
+
+  // 22o) 只有表头无数据行：不可应用
+  const headerOnly = buildBulkPreview(`${HEADER}\n\n  \n`, [], hostPlan)
+  check('只有表头：0 行、不可应用', headerOnly.hasContent && headerOnly.rows.length === 0 && !headerOnly.canApply && !headerOnly.headerError)
+
+  // 22p) 未被 CSV 触及的无关登记（含其它网段、失效孤儿）原样保留
+  const untouchedHosts: HostAssignment[] = [
+    { id: 'u1', ownerId: 'q2', name: '机房设备', address: ipToInt('192.168.10.65'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:a1' },
+    { id: 'u2', ownerId: 'gone', name: '孤儿', address: ipToInt('192.168.10.40'), mode: 'manual', mac: 'aa:bb:cc:dd:ee:a2' },
+  ]
+  const untCsv = [HEADER, '192.168.10.16/30,新设备,192.168.10.17,aa:bb:cc:dd:ee:a3'].join('\n')
+  const untPrev = buildBulkPreview(untCsv, untouchedHosts, hostPlan)
+  check('无关登记与孤儿不阻断新登记导入', untPrev.canApply && untPrev.counts.add === 1, JSON.stringify(untPrev.rows.map((r) => r.errors)))
+  const untApplied = applyBulkPreview(untPrev, untouchedHosts, () => 'n1')
+  check('未触及登记（含孤儿）原样保留', untApplied.length === 3 && untApplied[0].id === 'u1' && untApplied[1].id === 'u2' && untApplied[1].ownerId === 'gone')
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)

@@ -106,7 +106,7 @@ export default function Option121Panel({
 
   return (
     <div className="panel opt121-panel">
-      <h2>⑦ DHCP Option 121（无分类静态路由 / RFC 3442）</h2>
+      <h2>⑧ DHCP Option 121（无分类静态路由 / RFC 3442）</h2>
       <p className="subtitle" style={{ marginBottom: 10 }}>
         选择一个当前<strong>成功分配</strong>的固定 / 自动网段作为<strong>客户端网段</strong>，
         录入多条「目的 CIDR + 下一跳 IPv4」：目的须为规范网络地址（允许

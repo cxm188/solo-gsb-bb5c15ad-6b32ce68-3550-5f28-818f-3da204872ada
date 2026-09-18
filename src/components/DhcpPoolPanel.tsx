@@ -113,7 +113,7 @@ export default function DhcpPoolPanel({
 
   return (
     <div className="panel opt121-panel dhcp-pool-panel">
-      <h2>⑨ DHCP 动态地址池（dnsmasq dhcp-range）</h2>
+      <h2>⑩ DHCP 动态地址池（dnsmasq dhcp-range）</h2>
       <p className="subtitle" style={{ marginBottom: 10 }}>
         选择一个当前<strong>成功分配</strong>的固定 / 自动网段，录入多段<strong>手工排除区间</strong>
         （起始 ~ 结束，结束留空表示仅排除单地址）。模块自动排除该网段的<strong>网络地址、广播地址</strong>
